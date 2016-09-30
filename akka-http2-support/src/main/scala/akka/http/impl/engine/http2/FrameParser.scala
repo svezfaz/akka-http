@@ -47,7 +47,6 @@ class FrameParser(shouldReadPreface: Boolean) extends ByteStringParser[FrameEven
     }
 
   def parseFrame(tpe: FrameType, flags: ByteFlag, streamId: Int, payload: ByteReader): FrameEvent = {
-
     // TODO: add @switch? seems non-trivial for now
     tpe match {
       case HEADERS ⇒
@@ -82,8 +81,7 @@ class FrameParser(shouldReadPreface: Boolean) extends ByteStringParser[FrameEven
 
       case SETTINGS ⇒
         val ack = Flags.ACK.isSet(flags)
-
-        // TODO: validate that streamId = 0
+        Http2Compliance.requireZeroStreamId(streamId)
 
         if (ack) SettingsAckFrame // TODO: validate that payload is empty
         else {
@@ -108,7 +106,7 @@ class FrameParser(shouldReadPreface: Boolean) extends ByteStringParser[FrameEven
 
       case CONTINUATION ⇒
         val endHeaders = Flags.END_HEADERS.isSet(flags)
-        // TODO: check that streamId > 0
+        Http2Compliance.requirePositiveStreamId(streamId)
 
         ContinuationFrame(streamId, endHeaders, payload.remainingData)
 
