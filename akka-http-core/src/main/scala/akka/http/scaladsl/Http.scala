@@ -23,6 +23,7 @@ import akka.http.scaladsl.model.headers.Host
 import akka.http.scaladsl.model.ws.{ Message, WebSocketRequest, WebSocketUpgradeResponse }
 import akka.http.scaladsl.settings.{ ClientConnectionSettings, ConnectionPoolSettings, ServerSettings }
 import akka.http.scaladsl.util.FastFuture
+import akka.pattern.CircuitBreaker
 import akka.{ Done, NotUsed }
 import akka.stream._
 import akka.stream.TLSProtocol._
@@ -404,6 +405,14 @@ class HttpExt(private val config: Config)(implicit val system: ActorSystem) exte
     cachedHostConnectionPool(setup)
   }
 
+  def cachedHostConnectionPoolWithBreaker[T](breaker:  CircuitBreaker)(host: String, port: Int = 80,
+                                             settings: ConnectionPoolSettings = defaultConnectionPoolSettings,
+                                             log:      LoggingAdapter         = system.log)(implicit fm: Materializer): Flow[(HttpRequest, T), (Try[HttpResponse], T), HostConnectionPool] = {
+    val cps = ConnectionPoolSetup(settings, ConnectionContext.noEncryption(), log)
+    val setup = HostConnectionPoolSetup(host, port, cps, Some(breaker))
+    cachedHostConnectionPool(setup)
+  }
+
   /**
    * Same as [[#cachedHostConnectionPool]] but for encrypted (HTTPS) connections.
    *
@@ -419,6 +428,15 @@ class HttpExt(private val config: Config)(implicit val system: ActorSystem) exte
                                        log:               LoggingAdapter         = system.log)(implicit fm: Materializer): Flow[(HttpRequest, T), (Try[HttpResponse], T), HostConnectionPool] = {
     val cps = ConnectionPoolSetup(settings, connectionContext, log)
     val setup = HostConnectionPoolSetup(host, port, cps)
+    cachedHostConnectionPool(setup)
+  }
+
+  def cachedHostConnectionPoolWithBreakerHttps[T](breaker:  CircuitBreaker)(host: String, port: Int = 443,
+                                       connectionContext: HttpsConnectionContext = defaultClientHttpsContext,
+                                       settings:          ConnectionPoolSettings = defaultConnectionPoolSettings,
+                                       log:               LoggingAdapter         = system.log)(implicit fm: Materializer): Flow[(HttpRequest, T), (Try[HttpResponse], T), HostConnectionPool] = {
+    val cps = ConnectionPoolSetup(settings, connectionContext, log)
+    val setup = HostConnectionPoolSetup(host, port, cps, Some(breaker))
     cachedHostConnectionPool(setup)
   }
 
@@ -622,20 +640,27 @@ class HttpExt(private val config: Config)(implicit val system: ActorSystem) exte
     gateway: PoolGateway)(
     implicit
     fm: Materializer): Flow[(HttpRequest, T), (Try[HttpResponse], T), HostConnectionPool] =
-    clientFlow[T](hcps.setup.settings)(_ → gateway)
+    clientFlow[T](hcps.setup.settings, hcps.maybeBreaker)(_ → gateway)
       .mapMaterializedValue(_ ⇒ HostConnectionPool(hcps)(gateway))
 
-  private def clientFlow[T](settings: ConnectionPoolSettings)(f: HttpRequest ⇒ (HttpRequest, PoolGateway))(
+  private def clientFlow[T](settings: ConnectionPoolSettings, maybeBreaker: Option[CircuitBreaker] = None)(f: HttpRequest ⇒ (HttpRequest, PoolGateway))(
     implicit
     system: ActorSystem, fm: Materializer): Flow[(HttpRequest, T), (Try[HttpResponse], T), NotUsed] = {
+
+    def send(request: HttpRequest, userContext: T) = {
+      val (effectiveRequest, gateway) = f(request)
+      val result = Promise[(Try[HttpResponse], T)]() // TODO: simplify to `transformWith` when on Scala 2.12
+      gateway(effectiveRequest).onComplete(responseTry ⇒ result.success(responseTry → userContext))(fm.executionContext)
+      result.future
+    }
+
     // a connection pool can never have more than pipeliningLimit * maxConnections requests in flight at any point
     val parallelism = settings.pipeliningLimit * settings.maxConnections
     Flow[(HttpRequest, T)].mapAsyncUnordered(parallelism) {
-      case (request, userContext) ⇒
-        val (effectiveRequest, gateway) = f(request)
-        val result = Promise[(Try[HttpResponse], T)]() // TODO: simplify to `transformWith` when on Scala 2.12
-        gateway(effectiveRequest).onComplete(responseTry ⇒ result.success(responseTry → userContext))(fm.executionContext)
-        result.future
+      case (request, userContext) ⇒ maybeBreaker match {
+        case Some(breaker) ⇒ breaker.withCircuitBreaker(send(request, userContext))
+        case None          ⇒ send(request, userContext)
+      }
     }
   }
 
